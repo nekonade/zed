@@ -699,6 +699,10 @@ impl ExtensionStore {
             .map(|(id, _)| id.as_ref())
             .collect::<Vec<_>>()
             .join(",");
+        // Avoid a remote request when no installed extensions can be updated.
+        if extension_ids.is_empty() {
+            return Task::ready(Ok(Vec::new()));
+        }
         let task = self.fetch_extensions_from_api(
             "/extensions/updates",
             &[

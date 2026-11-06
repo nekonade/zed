@@ -22,7 +22,10 @@ use extension::{
 };
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
-use gpui::{AppContext as _, BackgroundExecutor, Entity, EntityId, TaskExt, TestAppContext};
+use gpui::{
+    AppContext as _, BackgroundExecutor, BorrowAppContext as _, Entity, EntityId, TaskExt,
+    TestAppContext,
+};
 use http_client::{FakeHttpClient, Response};
 use language::{
     BinaryStatus, LanguageConfig, LanguageMatcher, LanguageName, LanguageRegistry, QueryFiles,
@@ -4282,4 +4285,155 @@ impl Extension for FakeExtension {
     ) -> anyhow::Result<DebugRequest> {
         anyhow::bail!("not supported by FakeExtension")
     }
+}
+
+fn create_update_request_store(
+    status: u16,
+    cx: &mut TestAppContext,
+) -> (Entity<ExtensionStore>, Arc<Mutex<Vec<String>>>) {
+    init_test(cx);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let http_client = FakeHttpClient::create({
+        let requests = requests.clone();
+        move |request| {
+            requests.lock().push(request.uri().to_string());
+            async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .body(r#"{"data":[]}"#.into())?)
+            }
+        }
+    });
+    let fs = FakeFs::new(cx.executor());
+    let store = cx.new(|cx| {
+        ExtensionStore::new(
+            PathBuf::from("/extensions"),
+            None,
+            Arc::new(ExtensionHostProxy::new()),
+            fs,
+            http_client.clone(),
+            http_client,
+            None,
+            NodeRuntime::unavailable(),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.run_until_parked();
+    (store, requests)
+}
+
+#[gpui::test]
+async fn test_empty_update_requests_startup_and_empty_index(cx: &mut TestAppContext) {
+    let (store, requests) = create_update_request_store(200, cx);
+    assert!(
+        requests.lock().is_empty(),
+        "empty startup must not request updates"
+    );
+    let result = store
+        .update(cx, |store, cx| {
+            store.fetch_extensions_with_update_available(cx)
+        })
+        .await
+        .expect("empty updates should succeed");
+    assert!(result.is_empty());
+    assert!(requests.lock().is_empty());
+}
+
+#[gpui::test]
+async fn test_empty_update_requests_filtered_index(cx: &mut TestAppContext) {
+    let (store, requests) = create_update_request_store(200, cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings_store, cx| {
+            settings_store.update_user_settings(cx, |settings| {
+                settings
+                    .extension
+                    .auto_update_extensions
+                    .insert("disabled".into(), false);
+            });
+        });
+    });
+    store.update(cx, |store, _cx| {
+        let mut development = remote_sync_entry("development", "");
+        development.dev = true;
+        store
+            .extension_index
+            .extensions
+            .insert("development".into(), development);
+        store
+            .extension_index
+            .extensions
+            .insert("disabled".into(), remote_sync_entry("disabled", ""));
+    });
+    let result = store
+        .update(cx, |store, cx| {
+            store.fetch_extensions_with_update_available(cx)
+        })
+        .await
+        .expect("filtered updates should succeed");
+    assert!(result.is_empty());
+    assert!(requests.lock().is_empty());
+}
+
+#[gpui::test]
+async fn test_empty_update_requests_preserves_nonempty_query(cx: &mut TestAppContext) {
+    let (store, requests) = create_update_request_store(200, cx);
+    store.update(cx, |store, _cx| {
+        store
+            .extension_index
+            .extensions
+            .insert("eligible".into(), remote_sync_entry("eligible", ""));
+        let mut development = remote_sync_entry("development", "");
+        development.dev = true;
+        store
+            .extension_index
+            .extensions
+            .insert("development".into(), development);
+    });
+    let result = store
+        .update(cx, |store, cx| {
+            store.fetch_extensions_with_update_available(cx)
+        })
+        .await
+        .expect("synthetic update response should succeed");
+    assert!(result.is_empty());
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 1);
+    let url = url::Url::parse(&requests[0]).expect("valid synthetic request URL");
+    assert_eq!(url.path(), "/extensions/updates");
+    let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(query.get("ids").map(String::as_str), Some("eligible"));
+    for key in [
+        "min_schema_version",
+        "max_schema_version",
+        "min_wasm_api_version",
+        "max_wasm_api_version",
+    ] {
+        assert!(
+            query.contains_key(key),
+            "compatibility bound missing: {key}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_empty_update_requests_preserves_http_error(cx: &mut TestAppContext) {
+    let (store, requests) = create_update_request_store(403, cx);
+    store.update(cx, |store, _cx| {
+        store
+            .extension_index
+            .extensions
+            .insert("eligible".into(), remote_sync_entry("eligible", ""));
+    });
+    let result = store
+        .update(cx, |store, cx| {
+            store.fetch_extensions_with_update_available(cx)
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "nonempty request errors must still propagate"
+    );
+    assert_eq!(requests.lock().len(), 1);
 }
